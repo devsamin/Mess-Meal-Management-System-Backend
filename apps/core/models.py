@@ -40,6 +40,14 @@ class MessSettings(models.Model):
         obj, _ = cls.objects.get_or_create(pk=1)
         return obj
 
+    @classmethod
+    def for_request(cls, request) -> "MessSettings":
+        """``load()`` memoised on the request, so one request reads the row once."""
+        cached = getattr(request, "_mess_settings", None)
+        if cached is None:
+            cached = request._mess_settings = cls.load()
+        return cached
+
 
 class ActivityLog(models.Model):
     class Action(models.TextChoices):

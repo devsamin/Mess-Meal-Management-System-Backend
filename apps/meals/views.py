@@ -12,6 +12,8 @@ from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.response import Response
 
 from apps.core.activity import log_activity
+from apps.core.cache import cache, cached_response, month_tag
+from apps.core.models import MessSettings
 from apps.core.money import ZERO
 from apps.core.permissions import IsManager, IsManagerOrReadOnly, MemberVisibilityMixin, is_manager
 from apps.meals.models import MealRecord, MealType, WeeklyMenu
@@ -33,6 +35,11 @@ class MealFilter(filters.FilterSet):
         fields = ["month", "member", "date", "meal_type"]
 
 
+def _edit_settings(request) -> MessSettings | None:
+    """Settings for meal-edit checks; managers are never restricted by them, so skip the read."""
+    return None if is_manager(request.user) else MessSettings.for_request(request)
+
+
 def _account_from_query(request) -> MonthlyAccount:
     month_id = request.query_params.get("month")
     if not month_id:
@@ -49,7 +56,7 @@ class MealRecordViewSet(MemberVisibilityMixin, viewsets.ModelViewSet):
         return self.restrict_to_own(MealRecord.objects.select_related("member", "account"))
 
     def _check(self, member, day, account):
-        reason = meal_edit_denial(self.request.user, member, day, account)
+        reason = meal_edit_denial(self.request.user, member, day, account, _edit_settings(self.request))
         if reason:
             raise PermissionDenied(reason)
 
@@ -86,6 +93,7 @@ class MealRecordViewSet(MemberVisibilityMixin, viewsets.ModelViewSet):
         memberships = self.restrict_to_own(
             MonthMember.objects.filter(account=account).select_related("member").order_by("member__name")
         )
+        settings = _edit_settings(request)
         cells = defaultdict(dict)
         for r in MealRecord.objects.filter(account=account, date=day):
             cells[r.member_id][r.meal_type] = r.quantity
@@ -100,7 +108,7 @@ class MealRecordViewSet(MemberVisibilityMixin, viewsets.ModelViewSet):
                 "member_id": mm.member_id,
                 "name": mm.member.name,
                 "present": mm.is_present_on(day),
-                "editable": meal_edit_denial(request.user, mm.member, day, account) is None,
+                "editable": meal_edit_denial(request.user, mm.member, day, account, settings) is None,
                 "meals": {t: _num(v) for t, v in meals.items()},
                 "total": _num(sum(meals.values(), ZERO)),
             })
@@ -124,6 +132,7 @@ class MealRecordViewSet(MemberVisibilityMixin, viewsets.ModelViewSet):
         entries = serializer.validated_data["entries"]
 
         enrolled = set(MonthMember.objects.filter(account=account).values_list("member_id", flat=True))
+        settings = _edit_settings(request)
         errors = []
         for i, e in enumerate(entries):
             if not account.contains(e["date"]):
@@ -131,26 +140,13 @@ class MealRecordViewSet(MemberVisibilityMixin, viewsets.ModelViewSet):
             elif e["member"].pk not in enrolled:
                 errors.append({"index": i, "detail": f"{e['member']} is not a member of {account.label}."})
             else:
-                reason = meal_edit_denial(request.user, e["member"], e["date"], account)
+                reason = meal_edit_denial(request.user, e["member"], e["date"], account, settings)
                 if reason:
                     raise PermissionDenied(reason)
         if errors:
             raise ValidationError({"entries": errors})
 
-        saved = deleted = 0
-        with transaction.atomic():
-            for e in entries:
-                key = {"member": e["member"], "date": e["date"], "meal_type": e["meal_type"]}
-                if e["quantity"] == 0:
-                    deleted += MealRecord.objects.filter(account=account, **key).delete()[0]
-                    continue
-                MealRecord.objects.update_or_create(
-                    **key,
-                    defaults={"account": account, "quantity": e["quantity"], "updated_by": request.user},
-                    create_defaults={"account": account, "quantity": e["quantity"], "created_by": request.user,
-                                     "updated_by": request.user},
-                )
-                saved += 1
+        saved, deleted = self._apply_entries(account, entries, request.user)
         dates = sorted({e["date"] for e in entries})
         when = dates[0].isoformat() if len(dates) == 1 else f"{dates[0]} – {dates[-1]}"
         if not is_manager(request.user) or len(entries) > 1:
@@ -158,17 +154,80 @@ class MealRecordViewSet(MemberVisibilityMixin, viewsets.ModelViewSet):
                          account=account, entity_type="meal")
         return Response({"saved": saved, "deleted": deleted}, status=status.HTTP_200_OK)
 
+    @staticmethod
+    def _apply_entries(account, entries, user) -> tuple[int, int]:
+        """Upsert/delete meal cells with a handful of queries instead of two or three per cell.
+
+        Behaves like a sequential ``update_or_create`` per entry (later entries win);
+        a quantity of 0 deletes the cell.
+        """
+        now = timezone.now()
+        saved = deleted = 0
+        with transaction.atomic():
+            existing = {
+                (r.member_id, r.date, r.meal_type): r
+                for r in MealRecord.objects.filter(
+                    member_id__in={e["member"].pk for e in entries},
+                    date__in={e["date"] for e in entries},
+                    meal_type__in={e["meal_type"] for e in entries},
+                )
+            }
+            to_create: dict[tuple, MealRecord] = {}
+            to_update: dict[int, MealRecord] = {}
+            to_delete: set[int] = set()
+            for e in entries:
+                key = (e["member"].pk, e["date"], e["meal_type"])
+                rec = existing.get(key)
+                if e["quantity"] == 0:
+                    if rec is not None and rec.account_id == account.pk:
+                        if key in to_create:
+                            del to_create[key]
+                        else:
+                            to_delete.add(rec.pk)
+                            to_update.pop(rec.pk, None)
+                        del existing[key]
+                        deleted += 1
+                    continue
+                if rec is None:
+                    rec = MealRecord(account=account, member=e["member"], date=e["date"], meal_type=e["meal_type"],
+                                     created_by=user, updated_by=user)
+                    to_create[key] = existing[key] = rec
+                else:
+                    rec.account = account
+                    rec.updated_by = user
+                    rec.updated_at = now
+                    if key not in to_create:
+                        to_update[rec.pk] = rec
+                rec.quantity = e["quantity"]
+                saved += 1
+            if to_delete:
+                MealRecord.objects.filter(pk__in=to_delete).delete()
+            if to_update:
+                MealRecord.objects.bulk_update(to_update.values(), ["account", "quantity", "updated_by", "updated_at"])
+            if to_create:
+                MealRecord.objects.bulk_create(to_create.values())
+            # bulk_create / bulk_update / queryset.delete skip the model signals that normally invalidate.
+            cache.invalidate_on_commit(month_tag(account.pk))
+        return saved, deleted
+
     @extend_schema(parameters=[OpenApiParameter("month", int, required=True)])
     @action(detail=False, methods=["get"])
     def grid(self, request):
         """Member × day totals for the whole month (spreadsheet view)."""
-        account = _account_from_query(request)
-        data = member_day_grid(account)
-        visible = set(
-            self.restrict_to_own(MonthMember.objects.filter(account=account)).values_list("member_id", flat=True)
-        )
-        data["rows"] = [r for r in data["rows"] if r["member_id"] in visible]
-        return Response(data)
+        def compute():
+            account = _account_from_query(request)
+            data = member_day_grid(account)
+            visible = set(
+                self.restrict_to_own(MonthMember.objects.filter(account=account)).values_list("member_id", flat=True)
+            )
+            data["rows"] = [r for r in data["rows"] if r["member_id"] in visible]
+            return data, account.is_closed
+
+        raw = request.query_params.get("month", "")
+        if not raw.isascii() or not raw.isdigit():
+            return Response(compute()[0])  # missing/garbage month: let the normal validation answer, never cache
+        # int() so "03" and "3" share one cache tag; writes invalidate by the integer id.
+        return cached_response(request, "grid", int(raw), compute)
 
 
 class WeeklyMenuViewSet(viewsets.ModelViewSet):

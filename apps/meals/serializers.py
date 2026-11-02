@@ -44,8 +44,21 @@ class MealRecordSerializer(MonthRecordSerializerMixin, serializers.ModelSerializ
         return attrs
 
 
+class PreloadedMemberField(serializers.PrimaryKeyRelatedField):
+    """Member lookup that uses the batch ``BulkMealSerializer`` loaded, not one SELECT per entry."""
+
+    def to_internal_value(self, data):
+        members = self.context.get("_members")
+        if members is None:
+            return super().to_internal_value(data)
+        try:
+            return members[int(data)]
+        except (KeyError, TypeError, ValueError):
+            self.fail("does_not_exist", pk_value=data)
+
+
 class BulkMealEntrySerializer(serializers.Serializer):
-    member = serializers.PrimaryKeyRelatedField(queryset=Member.objects.all())
+    member = PreloadedMemberField(queryset=Member.objects.all())
     meal_type = serializers.ChoiceField(choices=MealType.choices)
     quantity = serializers.DecimalField(max_digits=4, decimal_places=1)
     date = serializers.DateField(required=False)
@@ -58,6 +71,18 @@ class BulkMealSerializer(serializers.Serializer):
     account = serializers.PrimaryKeyRelatedField(queryset=MonthlyAccount.objects.all())
     date = serializers.DateField(required=False)
     entries = BulkMealEntrySerializer(many=True, allow_empty=False)
+
+    def to_internal_value(self, data):
+        entries = data.get("entries") if hasattr(data, "get") else None
+        if isinstance(entries, list):
+            ids = set()
+            for e in entries:
+                try:
+                    ids.add(int(e.get("member")))
+                except (AttributeError, TypeError, ValueError):
+                    pass  # reported by the field itself
+            self._context["_members"] = Member.objects.in_bulk(ids)
+        return super().to_internal_value(data)
 
     def validate(self, attrs):
         for entry in attrs["entries"]:

@@ -6,8 +6,9 @@ from rest_framework.decorators import api_view
 from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
 
-from apps.core.models import ActivityLog, MessSettings
-from apps.core.permissions import is_manager, own_member
+from apps.core.cache import cached_response
+from apps.core.models import ActivityLog
+from apps.core.permissions import can_view_all, own_member
 from apps.core.serializers import ActivityLogSerializer
 from apps.finance.models import Expense
 from apps.finance.serializers import ExpenseSerializer
@@ -18,7 +19,7 @@ from apps.reports.services import daily_meal_totals, report_as_dict, summary_as_
 
 def _visible(request, data: dict) -> dict:
     """Hide other members' rows from regular members when transparency is off."""
-    if is_manager(request.user) or MessSettings.load().members_can_view_all:
+    if can_view_all(request):
         return data
     me = own_member(request.user)
     my_id = me.pk if me else None
@@ -41,39 +42,50 @@ def _visible(request, data: dict) -> dict:
 @api_view(["GET"])
 def month_summary(request, pk):
     """Meal rate, totals and every member's balance for the month."""
-    account = get_object_or_404(MonthlyAccount, pk=pk)
-    return Response(_visible(request, summary_as_dict(account)))
+    def compute():
+        account = get_object_or_404(MonthlyAccount, pk=pk)
+        return _visible(request, summary_as_dict(account)), account.is_closed
+
+    return cached_response(request, "summary", pk, compute)
 
 
 @extend_schema(responses=dict)
 @api_view(["GET"])
 def month_report(request, pk):
     """Full report: summary, daily meals, member × day grid, expenses, deposits, bills."""
-    account = get_object_or_404(MonthlyAccount, pk=pk)
-    return Response(_visible(request, report_as_dict(account)))
+    def compute():
+        account = get_object_or_404(MonthlyAccount, pk=pk)
+        return _visible(request, report_as_dict(account)), account.is_closed
+
+    return cached_response(request, "report", pk, compute)
 
 
 @extend_schema(responses=dict)
 @api_view(["GET"])
 def month_dashboard(request, pk):
+    today = timezone.localdate()  # part of the cache key: "today" rolls over at midnight
+    return cached_response(request, "dashboard", pk, lambda: _dashboard(request, pk, today),
+                           params={**request.query_params, "today": today.isoformat()})
+
+
+def _dashboard(request, pk, today):
     account = get_object_or_404(MonthlyAccount, pk=pk)
     summary = _visible(request, summary_as_dict(account))
     daily = (account.final_report or {}).get("daily_meals") if account.is_closed else None
     daily = daily or daily_meal_totals(account)
-    today = timezone.localdate()
     today_row = next((d for d in daily if d["date"] == today.isoformat()), None)
 
     recent_expenses = Expense.objects.filter(account=account).select_related(
         "category", "purchaser", "created_by", "approved_by")
     activity = ActivityLog.objects.filter(account=account).select_related("actor")
-    if not (is_manager(request.user) or MessSettings.load().members_can_view_all):
+    if not can_view_all(request):
         me = own_member(request.user)
         recent_expenses = recent_expenses.filter(purchaser=me)
         activity = activity.filter(actor=request.user)
 
     me = own_member(request.user)
     my_line = next((m for m in summary["members"] if me and m["member_id"] == me.pk), None)
-    return Response({
+    data = {
         "summary": summary,
         "daily_meals": daily,
         "today": today_row,
@@ -82,7 +94,8 @@ def month_dashboard(request, pk):
         "recent_expenses": ExpenseSerializer(recent_expenses.order_by("-date", "-id")[:6], many=True,
                                              context={"request": request}).data,
         "recent_activity": ActivityLogSerializer(activity[:10], many=True).data,
-    })
+    }
+    return data, account.is_closed
 
 
 @extend_schema(parameters=[OpenApiParameter("file_format", str, enum=["csv", "xlsx"])], responses=bytes)

@@ -108,7 +108,7 @@ class Deposit(TimeStampedModel):
     class Meta:
         ordering = ["-date", "-id"]
         constraints = [models.CheckConstraint(condition=models.Q(amount__gt=0), name="deposit_amount_positive")]
-        indexes = [models.Index(fields=["account", "member"])]
+        indexes = [models.Index(fields=["account", "member"]), models.Index(fields=["account", "date"])]
 
     def __str__(self):
         return f"{self.member} {self.kind} ৳{self.amount}"
@@ -148,6 +148,7 @@ class ExtraBill(TimeStampedModel):
                 name="personal_bill_needs_payer",
             ),
         ]
+        indexes = [models.Index(fields=["account", "date"])]
 
     def __str__(self):
         return f"{self.title} ৳{self.amount}"

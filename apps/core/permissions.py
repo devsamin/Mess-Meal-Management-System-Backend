@@ -11,6 +11,11 @@ def own_member(user):
     return getattr(user, "member", None) if user and user.is_authenticated else None
 
 
+def can_view_all(request) -> bool:
+    """Managers, or everyone when the mess has transparency turned on."""
+    return is_manager(request.user) or MessSettings.for_request(request).members_can_view_all
+
+
 class IsManager(BasePermission):
     message = "Only a manager can do this."
 
@@ -37,7 +42,7 @@ class MemberVisibilityMixin:
 
     def restrict_to_own(self, queryset):
         user = self.request.user
-        if getattr(self, "swagger_fake_view", False) or is_manager(user) or MessSettings.load().members_can_view_all:
+        if getattr(self, "swagger_fake_view", False) or can_view_all(self.request):
             return queryset
         member = own_member(user)
         if member is None:

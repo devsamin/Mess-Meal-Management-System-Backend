@@ -13,6 +13,8 @@ import dj_database_url
 from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+# Real environment variables win over both files; .env.local (untracked) holds secrets such as the Redis token.
+load_dotenv(BASE_DIR / ".env.local")
 load_dotenv(BASE_DIR / ".env")
 
 
@@ -153,6 +155,23 @@ SIMPLE_JWT = {
     "AUTH_HEADER_TYPES": ("Bearer",),
     "SIGNING_KEY": os.environ.get("JWT_SIGNING_KEY", SECRET_KEY),
 }
+
+# Upstash Redis (REST) cache -----------------------------------------------
+# Optional: with no URL/token the API simply runs uncached. Credentials are read
+# from the environment only and never appear in any response.
+UPSTASH_REDIS_REST_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "").strip()
+UPSTASH_REDIS_REST_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "").strip()
+REDIS_CACHE_ENABLED = (
+    env_bool("REDIS_CACHE_ENABLED", True)
+    and bool(UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN)
+    # `manage.py test` must never talk to the real cache; cache tests inject a fake client.
+    and not ("test" in sys.argv and not env_bool("REDIS_TEST_LIVE", False))
+)
+REDIS_KEY_PREFIX = os.environ.get("REDIS_KEY_PREFIX", "mess:v1")
+REDIS_TIMEOUT = float(os.environ.get("REDIS_TIMEOUT", "1.5"))  # seconds per Redis call
+REDIS_BREAKER_SECONDS = int(os.environ.get("REDIS_BREAKER_SECONDS", "30"))  # skip Redis this long after a failure
+REDIS_TTL_OPEN = int(os.environ.get("REDIS_TTL_OPEN", "120"))  # open month: data changes often
+REDIS_TTL_CLOSED = int(os.environ.get("REDIS_TTL_CLOSED", "600"))  # closed month: frozen until reopened
 
 SPECTACULAR_SETTINGS = {
     "TITLE": "Mess Meal Management API",

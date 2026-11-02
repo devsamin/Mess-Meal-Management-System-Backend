@@ -160,7 +160,8 @@ def calculate_month(account: MonthlyAccount) -> MonthSummary:
 
     # --- Members taking part in this month -------------------------------
     lines: dict[int, MemberBalance] = {}
-    for mm in MonthMember.objects.filter(account=account).select_related("member"):
+    # Through the reverse manager so ``mm.account`` is pre-filled (days_present reads it).
+    for mm in account.memberships.select_related("member"):
         lines[mm.member_id] = MemberBalance(
             member_id=mm.member_id,
             name=mm.member.name,
@@ -184,41 +185,72 @@ def calculate_month(account: MonthlyAccount) -> MonthSummary:
     summary.total_meals = sum((m.meals for m in lines.values()), ZERO)
 
     # --- Expenses ----------------------------------------------------------
-    expenses = Expense.objects.filter(account=account)
-    approved = expenses.filter(status=Expense.Status.APPROVED)
-    pending = expenses.filter(status=Expense.Status.PENDING)
-    summary.pending_expense_count = pending.count()
-    summary.pending_expense_amount = pending.aggregate(t=Sum("amount"))["t"] or ZERO
+    approved_rows = []
+    for row in (
+        Expense.objects.filter(account=account)
+        .values("status", "include_in_meal_rate", "payment_source", "category_id", "category__name", "category__code")
+        .annotate(total=Sum("amount"), n=Count("id"))
+        .order_by()
+    ):
+        total = row["total"] or ZERO
+        if row["status"] == Expense.Status.PENDING:
+            summary.pending_expense_count += row["n"]
+            summary.pending_expense_amount += total
+        elif row["status"] == Expense.Status.APPROVED:
+            approved_rows.append((row, total))
 
-    summary.meal_expenses = approved.filter(include_in_meal_rate=True).aggregate(t=Sum("amount"))["t"] or ZERO
-    summary.shared_expenses = approved.filter(include_in_meal_rate=False).aggregate(t=Sum("amount"))["t"] or ZERO
-    fund_expenses = approved.filter(payment_source=PaymentSource.FUND).aggregate(t=Sum("amount"))["t"] or ZERO
-    for member_id, total in _sum_by(approved.filter(payment_source=PaymentSource.PERSONAL), "purchaser_id").items():
+    fund_expenses = ZERO
+    categories: dict[tuple, dict] = {}
+    for row, total in approved_rows:
+        if row["include_in_meal_rate"]:
+            summary.meal_expenses += total
+        else:
+            summary.shared_expenses += total
+        if row["payment_source"] == PaymentSource.FUND:
+            fund_expenses += total
+        entry = categories.setdefault(
+            (row["category_id"], row["include_in_meal_rate"]),
+            {
+                "category_id": row["category_id"],
+                "category": row["category__name"],
+                "code": row["category__code"],
+                "in_meal_rate": row["include_in_meal_rate"],
+                "amount": ZERO,
+                "count": 0,
+            },
+        )
+        entry["amount"] += total
+        entry["count"] += row["n"]
+    summary.category_totals = sorted(categories.values(), key=lambda c: c["amount"], reverse=True)
+
+    approved_personal = Expense.objects.filter(
+        account=account, status=Expense.Status.APPROVED, payment_source=PaymentSource.PERSONAL
+    )
+    for member_id, total in _sum_by(approved_personal, "purchaser_id").items():
         line(member_id).personal_expenses = total
 
-    summary.category_totals = [
-        {
-            "category_id": row["category_id"],
-            "category": row["category__name"],
-            "code": row["category__code"],
-            "in_meal_rate": row["include_in_meal_rate"],
-            "amount": row["total"],
-            "count": row["n"],
-        }
-        for row in approved.values("category_id", "category__name", "category__code", "include_in_meal_rate")
-        .annotate(total=Sum("amount"), n=Count("id"))
-        .order_by("-total")
-    ]
-
     # --- Extra bills ---------------------------------------------------------
-    bills = ExtraBill.objects.filter(account=account)
-    summary.meal_bills = bills.filter(include_in_meal_rate=True).aggregate(t=Sum("amount"))["t"] or ZERO
-    fund_bills = bills.filter(payment_source=PaymentSource.FUND).aggregate(t=Sum("amount"))["t"] or ZERO
-    for member_id, total in _sum_by(bills.filter(payment_source=PaymentSource.PERSONAL), "paid_by_id").items():
+    fund_bills = ZERO
+    personal_bills: dict[int, Decimal] = defaultdict(lambda: ZERO)
+    for row in (
+        ExtraBill.objects.filter(account=account)
+        .values("include_in_meal_rate", "payment_source", "paid_by_id")
+        .annotate(total=Sum("amount"))
+        .order_by()
+    ):
+        total = row["total"] or ZERO
+        if row["include_in_meal_rate"]:
+            summary.meal_bills += total
+        else:
+            summary.split_bills += total
+        if row["payment_source"] == PaymentSource.FUND:
+            fund_bills += total
+        else:
+            personal_bills[row["paid_by_id"]] += total
+    for member_id, total in personal_bills.items():
         line(member_id).personal_bills = total
 
-    split_bills = bills.filter(include_in_meal_rate=False)
-    summary.split_bills = split_bills.aggregate(t=Sum("amount"))["t"] or ZERO
+    split_bills = ExtraBill.objects.filter(account=account, include_in_meal_rate=False)
     shares = ExtraBillShare.objects.filter(bill__in=split_bills)
     for member_id, total in _sum_by(shares, "member_id").items():
         line(member_id).bill_charges = total
@@ -228,11 +260,14 @@ def calculate_month(account: MonthlyAccount) -> MonthSummary:
         summary.warnings.append("Some extra bills have no responsible members; they are split among everyone.")
 
     # --- Deposits -----------------------------------------------------------
-    deposits = Deposit.objects.filter(account=account)
-    for member_id, total in _sum_by(deposits.filter(kind=Deposit.Kind.DEPOSIT), "member_id").items():
-        line(member_id).deposits = total
-    for member_id, total in _sum_by(deposits.filter(kind=Deposit.Kind.REFUND), "member_id").items():
-        line(member_id).refunds = total
+    for row in (
+        Deposit.objects.filter(account=account).values("member_id", "kind").annotate(total=Sum("amount")).order_by()
+    ):
+        total = row["total"] or ZERO
+        if row["kind"] == Deposit.Kind.DEPOSIT:
+            line(row["member_id"]).deposits = total
+        elif row["kind"] == Deposit.Kind.REFUND:
+            line(row["member_id"]).refunds = total
     summary.total_deposits = sum((m.deposits for m in lines.values()), ZERO)
     summary.total_refunds = sum((m.refunds for m in lines.values()), ZERO)
 

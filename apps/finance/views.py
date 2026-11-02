@@ -1,5 +1,5 @@
 from django.db import transaction
-from django.db.models import Sum
+from django.db.models import Case, DecimalField, F, Sum, When
 from django_filters import rest_framework as filters
 from rest_framework import viewsets
 from rest_framework.decorators import action
@@ -149,9 +149,14 @@ class DepositViewSet(MemberVisibilityMixin, TotalsListMixin, viewsets.ModelViewS
     def list(self, request, *args, **kwargs):
         response = super().list(request, *args, **kwargs)
         qs = self.filter_queryset(self.get_queryset())
-        dep = qs.filter(kind=Deposit.Kind.DEPOSIT).aggregate(t=Sum("amount"))["t"] or 0
-        ref = qs.filter(kind=Deposit.Kind.REFUND).aggregate(t=Sum("amount"))["t"] or 0
-        response.data["total_amount"] = f"{dep - ref:.2f}"  # net of refunds
+        signed = Case(
+            When(kind=Deposit.Kind.DEPOSIT, then=F("amount")),
+            When(kind=Deposit.Kind.REFUND, then=-F("amount")),
+            default=0,
+            output_field=DecimalField(max_digits=14, decimal_places=2),
+        )
+        net = qs.aggregate(t=Sum(signed))["t"] or 0
+        response.data["total_amount"] = f"{net:.2f}"  # net of refunds
         return response
 
     def perform_create(self, serializer):

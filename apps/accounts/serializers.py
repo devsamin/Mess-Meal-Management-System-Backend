@@ -26,7 +26,8 @@ class MeSerializer(serializers.ModelSerializer):
         return {"id": member.pk, "name": member.name} if member else None
 
     def get_permissions(self, user) -> dict:
-        s = MessSettings.load()
+        request = self.context.get("request")
+        s = MessSettings.for_request(request) if request is not None else MessSettings.load()
         manager = user.is_manager
         has_member = getattr(user, "member", None) is not None
         return {

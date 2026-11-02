@@ -2,7 +2,7 @@ from rest_framework import generics, mixins, viewsets
 from rest_framework.permissions import SAFE_METHODS, IsAuthenticated
 
 from apps.core.models import ActivityLog, MessSettings
-from apps.core.permissions import IsManager, is_manager
+from apps.core.permissions import IsManager, can_view_all
 from apps.core.serializers import ActivityLogSerializer, MessSettingsSerializer
 
 
@@ -22,6 +22,6 @@ class ActivityLogViewSet(mixins.ListModelMixin, viewsets.GenericViewSet):
 
     def get_queryset(self):
         qs = ActivityLog.objects.select_related("actor")
-        if getattr(self, "swagger_fake_view", False) or is_manager(self.request.user) or MessSettings.load().members_can_view_all:
+        if getattr(self, "swagger_fake_view", False) or can_view_all(self.request):
             return qs
         return qs.filter(actor=self.request.user)
